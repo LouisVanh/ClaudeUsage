@@ -215,6 +215,7 @@ class ClaudeUsageBar:
             
             # Wait for user to log in
             session_key = None
+            all_cookies = None
             max_wait = 300  # 5 minutes
             elapsed = 0
             
@@ -226,10 +227,16 @@ class ClaudeUsageBar:
                     cookies = self.driver.get_cookies()
                     print(f"[{elapsed}s] Checking cookies... Found {len(cookies)} cookies")
                     
+                    # Print all cookie names for debugging
+                    cookie_names = [c['name'] for c in cookies]
+                    print(f"Cookie names: {cookie_names}")
+                    
                     for cookie in cookies:
                         if cookie['name'] == 'sessionKey':
                             session_key = cookie['value']
+                            all_cookies = cookies  # Save ALL cookies
                             print(f"✓ Found sessionKey: {session_key[:20]}...")
+                            print(f"Captured {len(all_cookies)} total cookies")
                             break
                     
                     if session_key:
@@ -266,9 +273,16 @@ class ClaudeUsageBar:
                     self.driver = None
             
             if session_key:
-                # Success!
+                # Success! Save session key AND all cookies
                 print(f"Saving session key: {session_key[:20]}...")
                 self.config['session_key'] = session_key
+                
+                # Save all cookies as a cookie string
+                if all_cookies:
+                    cookie_string = '; '.join([f"{c['name']}={c['value']}" for c in all_cookies])
+                    self.config['cookie_string'] = cookie_string
+                    print(f"Saved {len(all_cookies)} cookies")
+                
                 self.save_config()
                 print("Config saved!")
                 
@@ -319,6 +333,9 @@ class ClaudeUsageBar:
             return None
             
         try:
+            # Use full cookie string if available, otherwise just sessionKey
+            cookie_string = self.config.get('cookie_string', f'sessionKey={self.config["session_key"]}')
+            
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
                 'Accept': 'application/json',
@@ -329,9 +346,10 @@ class ClaudeUsageBar:
                 'Sec-Fetch-Mode': 'cors',
                 'Sec-Fetch-Site': 'same-origin',
                 'Connection': 'keep-alive',
-                'Cookie': f'sessionKey={self.config["session_key"]}'
+                'Cookie': cookie_string
             }
             
+            print(f"Using cookies: {cookie_string[:100]}...")
             print("Fetching organizations...")
             # Get organizations
             response = requests.get(
@@ -368,6 +386,10 @@ class ClaudeUsageBar:
             elif response.status_code == 401:
                 print("Session expired (401)")
                 self.root.after(0, self.handle_auth_error)
+                return None
+            elif response.status_code == 403:
+                print("Forbidden (403) - Cookies may be invalid or incomplete")
+                print(f"Response: {response.text[:200]}")
                 return None
             
             print("No usage data available")
