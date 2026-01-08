@@ -616,44 +616,55 @@ class ClaudeUsageBar:
             return
         
         try:
-            usage_pct = 0
+            # Extract 5-hour usage
+            five_hour = self.usage_data.get('five_hour', {})
+            utilization = five_hour.get('utilization', 0.0)
+            resets_at = five_hour.get('resets_at')
             
-            if isinstance(self.usage_data, dict):
-                if 'usage_percentage' in self.usage_data:
-                    usage_pct = self.usage_data['usage_percentage']
-                elif 'usage_data' in self.usage_data and 'percentage' in self.usage_data['usage_data']:
-                    usage_pct = self.usage_data['usage_data']['percentage']
-                elif 'current' in self.usage_data and 'limit' in self.usage_data:
-                    current = self.usage_data['current']
-                    limit = self.usage_data['limit']
-                    if limit > 0:
-                        usage_pct = (current / limit) * 100
-                elif 'usage' in self.usage_data:
-                    usage = self.usage_data['usage']
-                    if isinstance(usage, dict):
-                        if 'percentage' in usage:
-                            usage_pct = usage['percentage']
-                        elif 'current' in usage and 'limit' in usage:
-                            if usage['limit'] > 0:
-                                usage_pct = (usage['current'] / usage['limit']) * 100
-            
-            self.usage_label.config(text=f"{usage_pct:.1f}% of limit used")
+            # Display usage
+            self.usage_label.config(text=f"{utilization:.1f}% of limit used")
             
             # Update progress bar
-            bar_width = int((usage_pct / 100) * 284)
+            bar_width = int((utilization / 100) * 284)
             self.progress_fill.place(width=bar_width)
             
             # Color based on usage
-            if usage_pct >= 90:
+            if utilization >= 90:
                 self.progress_fill.config(bg='#ff4444')
-            elif usage_pct >= 70:
+            elif utilization >= 70:
                 self.progress_fill.config(bg='#ffaa44')
             else:
                 self.progress_fill.config(bg='#CC785C')
+            
+            # Update reset timer
+            if resets_at:
+                try:
+                    from dateutil import parser
+                    reset_time = parser.parse(resets_at)
+                    now = datetime.now(reset_time.tzinfo)
+                    time_left = reset_time - now
+                    
+                    if time_left.total_seconds() > 0:
+                        hours = int(time_left.total_seconds() // 3600)
+                        minutes = int((time_left.total_seconds() % 3600) // 60)
+                        seconds = int(time_left.total_seconds() % 60)
+                        self.reset_label.config(text=f"Resets in: {hours:02d}:{minutes:02d}:{seconds:02d}")
+                    else:
+                        self.reset_label.config(text="Resetting soon...")
+                except:
+                    self.reset_label.config(text=f"Resets at: {resets_at}")
+            else:
+                # No active limit period
+                if utilization == 0:
+                    self.reset_label.config(text="No usage in current period")
+                else:
+                    self.reset_label.config(text="Resets: Not available")
                 
         except Exception as e:
             print(f"Error updating progress: {e}")
-            self.usage_label.config(text="Connected")
+            import traceback
+            traceback.print_exc()
+            self.usage_label.config(text="Error displaying usage")
         
         # Schedule next update
         self.root.after(1000, self.update_progress)
@@ -671,9 +682,30 @@ class ClaudeUsageBar:
     def show_settings(self, event=None):
         settings_win = tk.Toplevel(self.root)
         settings_win.title("Settings")
-        settings_win.geometry("350x250")
+        settings_win.geometry("350x320")
         settings_win.attributes('-topmost', True)
         settings_win.configure(bg='#1a1a1a')
+        
+        # Account info
+        tk.Label(
+            settings_win,
+            text="Account",
+            font=('Segoe UI', 9, 'bold'),
+            fg='#888888',
+            bg='#1a1a1a'
+        ).pack(pady=(15, 5))
+        
+        # Show session key snippet
+        session_key = self.config.get('session_key', 'Not logged in')
+        display_key = f"{session_key[:15]}..." if len(session_key) > 15 else session_key
+        
+        tk.Label(
+            settings_win,
+            text=f"Session: {display_key}",
+            font=('Segoe UI', 8),
+            fg='#666666',
+            bg='#1a1a1a'
+        ).pack()
         
         # Opacity
         tk.Label(
@@ -735,24 +767,28 @@ class ClaudeUsageBar:
             font=('Segoe UI', 9, 'bold'),
             padx=20,
             pady=6
-        ).pack(pady=20)
+        ).pack(pady=15)
         
         # Logout
         def logout():
             if messagebox.askyesno("Logout", "Log out and clear session?", parent=settings_win):
                 self.config['session_key'] = None
+                self.config['cookie_string'] = None
                 self.save_config()
                 settings_win.destroy()
+                messagebox.showinfo("Logged Out", "Please restart the app to log in again.")
                 self.root.quit()
         
         tk.Button(
             settings_win,
-            text="Logout",
+            text="🚪 Logout & Clear Session",
             command=logout,
-            bg='#2a2a2a',
-            fg='#888888',
+            bg='#3a3a3a',
+            fg='#ff8888',
             relief='flat',
-            font=('Segoe UI', 8)
+            font=('Segoe UI', 9),
+            padx=20,
+            pady=6
         ).pack()
     
     def on_close(self, event=None):
