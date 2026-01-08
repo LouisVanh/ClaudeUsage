@@ -32,6 +32,7 @@ class ClaudeUsageBar:
         self.polling_active = True
         self.driver = None
         self.login_in_progress = False
+        self.settings_window = None  # Track settings window
         
         # Setup UI
         self.setup_ui()
@@ -680,116 +681,228 @@ class ClaudeUsageBar:
         threading.Thread(target=refresh, daemon=True).start()
     
     def show_settings(self, event=None):
-        settings_win = tk.Toplevel(self.root)
-        settings_win.title("Settings")
-        settings_win.geometry("350x320")
-        settings_win.attributes('-topmost', True)
-        settings_win.configure(bg='#1a1a1a')
+        # Don't open multiple settings windows
+        if self.settings_window and tk.Toplevel.winfo_exists(self.settings_window):
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            return
+        
+        self.settings_window = tk.Toplevel(self.root)
+        self.settings_window.title("Settings")
+        self.settings_window.geometry("400x400")
+        self.settings_window.attributes('-topmost', True)
+        self.settings_window.configure(bg='#1a1a1a')
+        self.settings_window.protocol("WM_DELETE_WINDOW", lambda: self.close_settings())
         
         # Account info
         tk.Label(
-            settings_win,
+            self.settings_window,
             text="Account",
-            font=('Segoe UI', 9, 'bold'),
-            fg='#888888',
+            font=('Segoe UI', 10, 'bold'),
+            fg='#CC785C',
             bg='#1a1a1a'
-        ).pack(pady=(15, 5))
+        ).pack(pady=(20, 5))
         
         # Show session key snippet
         session_key = self.config.get('session_key', 'Not logged in')
         display_key = f"{session_key[:15]}..." if len(session_key) > 15 else session_key
         
         tk.Label(
-            settings_win,
+            self.settings_window,
             text=f"Session: {display_key}",
             font=('Segoe UI', 8),
             fg='#666666',
             bg='#1a1a1a'
-        ).pack()
+        ).pack(pady=(0, 5))
+        
+        # Separator
+        separator1 = tk.Frame(self.settings_window, bg='#333333', height=1)
+        separator1.pack(fill='x', padx=20, pady=15)
         
         # Opacity
         tk.Label(
-            settings_win,
-            text="Opacity:",
-            font=('Segoe UI', 9),
+            self.settings_window,
+            text="Window Opacity",
+            font=('Segoe UI', 9, 'bold'),
             fg='#cccccc',
             bg='#1a1a1a'
-        ).pack(pady=(15, 5))
+        ).pack(pady=(5, 5))
+        
+        opacity_frame = tk.Frame(self.settings_window, bg='#1a1a1a')
+        opacity_frame.pack(pady=5)
         
         opacity_var = tk.DoubleVar(value=self.config['opacity'])
-        opacity_slider = ttk.Scale(
-            settings_win,
+        opacity_value_label = tk.Label(
+            opacity_frame,
+            text=f"{int(opacity_var.get() * 100)}%",
+            font=('Segoe UI', 9),
+            fg='#888888',
+            bg='#1a1a1a',
+            width=5
+        )
+        opacity_value_label.pack(side='right', padx=(10, 0))
+        
+        def update_opacity_label(val):
+            opacity_value_label.config(text=f"{int(float(val) * 100)}%")
+            self.root.attributes('-alpha', float(val))
+        
+        opacity_slider = tk.Scale(
+            opacity_frame,
             from_=0.3,
             to=1.0,
+            resolution=0.05,
             variable=opacity_var,
             orient='horizontal',
-            length=250
+            length=250,
+            command=update_opacity_label,
+            bg='#2a2a2a',
+            fg='#CC785C',
+            highlightthickness=0,
+            troughcolor='#1a1a1a',
+            activebackground='#CC785C',
+            showvalue=0,
+            sliderrelief='flat',
+            width=15
         )
-        opacity_slider.pack()
+        opacity_slider.pack(side='left')
         
-        # Poll interval
+        # Separator
+        separator2 = tk.Frame(self.settings_window, bg='#333333', height=1)
+        separator2.pack(fill='x', padx=20, pady=15)
+        
+        # Poll interval with better UI
         tk.Label(
-            settings_win,
-            text="Update Interval (seconds):",
-            font=('Segoe UI', 9),
+            self.settings_window,
+            text="Update Interval",
+            font=('Segoe UI', 9, 'bold'),
             fg='#cccccc',
             bg='#1a1a1a'
-        ).pack(pady=(15, 5))
+        ).pack(pady=(5, 5))
+        
+        interval_frame = tk.Frame(self.settings_window, bg='#1a1a1a')
+        interval_frame.pack(pady=5)
         
         interval_var = tk.IntVar(value=self.config['poll_interval'])
-        interval_spinbox = tk.Spinbox(
-            settings_win,
-            from_=10,
-            to=300,
-            textvariable=interval_var,
-            font=('Segoe UI', 10),
-            bg='#2a2a2a',
-            fg='#ffffff',
-            width=10
-        )
-        interval_spinbox.pack()
         
-        # Save
+        # Minus button
+        def decrease_interval():
+            current = interval_var.get()
+            if current > 10:
+                interval_var.set(current - 10)
+        
+        minus_btn = tk.Button(
+            interval_frame,
+            text="−",
+            command=decrease_interval,
+            bg='#3a3a3a',
+            fg='#ffffff',
+            font=('Segoe UI', 14, 'bold'),
+            relief='flat',
+            cursor='hand2',
+            width=3,
+            height=1
+        )
+        minus_btn.pack(side='left', padx=5)
+        minus_btn.bind('<Enter>', lambda e: minus_btn.config(bg='#4a4a4a'))
+        minus_btn.bind('<Leave>', lambda e: minus_btn.config(bg='#3a3a3a'))
+        
+        # Display value
+        interval_display = tk.Label(
+            interval_frame,
+            textvariable=interval_var,
+            font=('Segoe UI', 12, 'bold'),
+            fg='#CC785C',
+            bg='#2a2a2a',
+            width=8,
+            relief='flat',
+            padx=10,
+            pady=5
+        )
+        interval_display.pack(side='left', padx=5)
+        
+        # Plus button
+        def increase_interval():
+            current = interval_var.get()
+            if current < 300:
+                interval_var.set(current + 10)
+        
+        plus_btn = tk.Button(
+            interval_frame,
+            text="+",
+            command=increase_interval,
+            bg='#3a3a3a',
+            fg='#ffffff',
+            font=('Segoe UI', 14, 'bold'),
+            relief='flat',
+            cursor='hand2',
+            width=3,
+            height=1
+        )
+        plus_btn.pack(side='left', padx=5)
+        plus_btn.bind('<Enter>', lambda e: plus_btn.config(bg='#4a4a4a'))
+        plus_btn.bind('<Leave>', lambda e: plus_btn.config(bg='#3a3a3a'))
+        
+        tk.Label(
+            self.settings_window,
+            text="seconds",
+            font=('Segoe UI', 8),
+            fg='#666666',
+            bg='#1a1a1a'
+        ).pack(pady=(0, 10))
+        
+        # Save button
         def save_settings():
             self.config['opacity'] = opacity_var.get()
             self.config['poll_interval'] = interval_var.get()
-            self.root.attributes('-alpha', self.config['opacity'])
             self.save_config()
-            settings_win.destroy()
+            self.close_settings()
         
         tk.Button(
-            settings_win,
-            text="Save Settings",
+            self.settings_window,
+            text="✓ Save Settings",
             command=save_settings,
             bg='#CC785C',
             fg='#ffffff',
             relief='flat',
-            font=('Segoe UI', 9, 'bold'),
-            padx=20,
-            pady=6
+            font=('Segoe UI', 10, 'bold'),
+            cursor='hand2',
+            padx=30,
+            pady=10
         ).pack(pady=15)
         
         # Logout
         def logout():
-            if messagebox.askyesno("Logout", "Log out and clear session?", parent=settings_win):
+            if messagebox.askyesno("Logout", "Log out and clear session?", parent=self.settings_window):
                 self.config['session_key'] = None
                 self.config['cookie_string'] = None
                 self.save_config()
-                settings_win.destroy()
+                self.close_settings()
                 messagebox.showinfo("Logged Out", "Please restart the app to log in again.")
                 self.root.quit()
         
-        tk.Button(
-            settings_win,
+        logout_btn = tk.Button(
+            self.settings_window,
             text="🚪 Logout & Clear Session",
             command=logout,
             bg='#3a3a3a',
             fg='#ff8888',
             relief='flat',
             font=('Segoe UI', 9),
+            cursor='hand2',
             padx=20,
-            pady=6
-        ).pack()
+            pady=8
+        )
+        logout_btn.pack()
+        logout_btn.bind('<Enter>', lambda e: logout_btn.config(bg='#4a3a3a'))
+        logout_btn.bind('<Leave>', lambda e: logout_btn.config(bg='#3a3a3a'))
+    
+    def close_settings(self):
+        if self.settings_window:
+            try:
+                self.settings_window.destroy()
+            except:
+                pass
+            self.settings_window = None
     
     def on_close(self, event=None):
         self.polling_active = False
