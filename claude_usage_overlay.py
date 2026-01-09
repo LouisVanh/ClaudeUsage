@@ -32,7 +32,7 @@ class ClaudeUsageBar:
         self.polling_active = True
         self.driver = None
         self.login_in_progress = False
-        self.settings_window = None  # Track settings window
+        self.settings_window = None
         
         # Setup UI
         self.setup_ui()
@@ -460,6 +460,23 @@ class ClaudeUsageBar:
         
         threading.Thread(target=initial_fetch, daemon=True).start()
     
+    def format_time_remaining(self, time_left_seconds):
+        """Format time remaining in a clear, readable way"""
+        if time_left_seconds <= 0:
+            return "Resetting soon..."
+        
+        hours = int(time_left_seconds // 3600)
+        minutes = int((time_left_seconds % 3600) // 60)
+        seconds = int(time_left_seconds % 60)
+        
+        # Format based on duration
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        elif minutes > 0:
+            return f"{minutes}m {seconds}s"
+        else:
+            return f"{seconds}s"
+    
     def setup_ui(self):
         self.main_frame = tk.Frame(
             self.root,
@@ -545,17 +562,17 @@ class ClaudeUsageBar:
         content = tk.Frame(self.main_frame, bg='#1a1a1a')
         content.pack(fill='x', padx=8, pady=8)
         
-        # Usage section
+        # 5-Hour Usage section
         tk.Label(
             content,
-            text="Current Usage",
+            text="5-Hour Limit",
             font=('Segoe UI', 8, 'bold'),
             fg='#888888',
             bg='#1a1a1a',
             anchor='w'
         ).pack(fill='x', pady=(0, 2))
         
-        self.usage_label = tk.Label(
+        self.five_hour_usage_label = tk.Label(
             content,
             text="Loading...",
             font=('Segoe UI', 9),
@@ -563,29 +580,71 @@ class ClaudeUsageBar:
             bg='#1a1a1a',
             anchor='w'
         )
-        self.usage_label.pack(fill='x', pady=(0, 2))
+        self.five_hour_usage_label.pack(fill='x', pady=(0, 2))
         
-        # Progress bar
-        progress_bg = tk.Frame(content, bg='#2a2a2a', height=12)
-        progress_bg.pack(fill='x', pady=(0, 4))
-        progress_bg.pack_propagate(False)
+        # 5-Hour Progress bar
+        five_hour_progress_bg = tk.Frame(content, bg='#2a2a2a', height=12)
+        five_hour_progress_bg.pack(fill='x', pady=(0, 2))
+        five_hour_progress_bg.pack_propagate(False)
         
-        self.progress_fill = tk.Frame(progress_bg, bg='#CC785C', height=12)
-        self.progress_fill.place(x=0, y=0, relheight=1, width=0)
+        self.five_hour_progress_fill = tk.Frame(five_hour_progress_bg, bg='#CC785C', height=12)
+        self.five_hour_progress_fill.place(x=0, y=0, relheight=1, width=0)
         
-        self.reset_label = tk.Label(
+        self.five_hour_reset_label = tk.Label(
             content,
-            text="Next reset: --:--:--",
+            text="Resets in: --",
             font=('Segoe UI', 7),
             fg='#666666',
             bg='#1a1a1a',
             anchor='w'
         )
-        self.reset_label.pack(fill='x')
+        self.five_hour_reset_label.pack(fill='x', pady=(0, 10))
+        
+        # Separator
+        separator = tk.Frame(content, bg='#333333', height=1)
+        separator.pack(fill='x', pady=(0, 8))
+        
+        # Weekly Usage section
+        tk.Label(
+            content,
+            text="Weekly Limit",
+            font=('Segoe UI', 8, 'bold'),
+            fg='#888888',
+            bg='#1a1a1a',
+            anchor='w'
+        ).pack(fill='x', pady=(0, 2))
+        
+        self.weekly_usage_label = tk.Label(
+            content,
+            text="Loading...",
+            font=('Segoe UI', 9),
+            fg='#cccccc',
+            bg='#1a1a1a',
+            anchor='w'
+        )
+        self.weekly_usage_label.pack(fill='x', pady=(0, 2))
+        
+        # Weekly Progress bar
+        weekly_progress_bg = tk.Frame(content, bg='#2a2a2a', height=12)
+        weekly_progress_bg.pack(fill='x', pady=(0, 2))
+        weekly_progress_bg.pack_propagate(False)
+        
+        self.weekly_progress_fill = tk.Frame(weekly_progress_bg, bg='#8B6BB7', height=12)
+        self.weekly_progress_fill.place(x=0, y=0, relheight=1, width=0)
+        
+        self.weekly_reset_label = tk.Label(
+            content,
+            text="Resets in: --",
+            font=('Segoe UI', 7),
+            fg='#666666',
+            bg='#1a1a1a',
+            anchor='w'
+        )
+        self.weekly_reset_label.pack(fill='x')
         
         # Set opacity
         self.root.attributes('-alpha', self.config['opacity'])
-        self.root.geometry('300x140')
+        self.root.geometry('300x240')
     
     def start_drag(self, event):
         self.dragging = True
@@ -619,53 +678,92 @@ class ClaudeUsageBar:
         try:
             # Extract 5-hour usage
             five_hour = self.usage_data.get('five_hour', {})
-            utilization = five_hour.get('utilization', 0.0)
-            resets_at = five_hour.get('resets_at')
+            five_hour_utilization = five_hour.get('utilization', 0.0)
+            five_hour_resets_at = five_hour.get('resets_at')
             
-            # Display usage
-            self.usage_label.config(text=f"{utilization:.1f}% of limit used")
+            # Display 5-hour usage
+            self.five_hour_usage_label.config(text=f"{five_hour_utilization:.1f}% used")
             
-            # Update progress bar
-            bar_width = int((utilization / 100) * 284)
-            self.progress_fill.place(width=bar_width)
+            # Update 5-hour progress bar
+            bar_width = int((five_hour_utilization / 100) * 284)
+            self.five_hour_progress_fill.place(width=bar_width)
             
-            # Color based on usage
-            if utilization >= 90:
-                self.progress_fill.config(bg='#ff4444')
-            elif utilization >= 70:
-                self.progress_fill.config(bg='#ffaa44')
+            # Color based on usage for 5-hour
+            if five_hour_utilization >= 90:
+                self.five_hour_progress_fill.config(bg='#ff4444')
+            elif five_hour_utilization >= 70:
+                self.five_hour_progress_fill.config(bg='#ffaa44')
             else:
-                self.progress_fill.config(bg='#CC785C')
+                self.five_hour_progress_fill.config(bg='#CC785C')
             
-            # Update reset timer
-            if resets_at:
+            # Update 5-hour reset timer
+            if five_hour_resets_at:
                 try:
                     from dateutil import parser
-                    reset_time = parser.parse(resets_at)
+                    reset_time = parser.parse(five_hour_resets_at)
                     now = datetime.now(reset_time.tzinfo)
                     time_left = reset_time - now
                     
                     if time_left.total_seconds() > 0:
-                        hours = int(time_left.total_seconds() // 3600)
-                        minutes = int((time_left.total_seconds() % 3600) // 60)
-                        seconds = int(time_left.total_seconds() % 60)
-                        self.reset_label.config(text=f"Resets in: {hours:02d}:{minutes:02d}:{seconds:02d}")
+                        time_str = self.format_time_remaining(time_left.total_seconds())
+                        self.five_hour_reset_label.config(text=f"Resets in: {time_str}")
                     else:
-                        self.reset_label.config(text="Resetting soon...")
+                        self.five_hour_reset_label.config(text="Resetting soon...")
                 except:
-                    self.reset_label.config(text=f"Resets at: {resets_at}")
+                    self.five_hour_reset_label.config(text=f"Resets: {five_hour_resets_at}")
             else:
-                # No active limit period
-                if utilization == 0:
-                    self.reset_label.config(text="No usage in current period")
+                if five_hour_utilization == 0:
+                    self.five_hour_reset_label.config(text="No active period")
                 else:
-                    self.reset_label.config(text="Resets: Not available")
+                    self.five_hour_reset_label.config(text="Reset time unavailable")
+            
+            # Extract weekly usage
+            weekly = self.usage_data.get('weekly', {})
+            weekly_utilization = weekly.get('utilization', 0.0)
+            weekly_resets_at = weekly.get('resets_at')
+            
+            # Display weekly usage
+            self.weekly_usage_label.config(text=f"{weekly_utilization:.1f}% used")
+            
+            # Update weekly progress bar
+            weekly_bar_width = int((weekly_utilization / 100) * 284)
+            self.weekly_progress_fill.place(width=weekly_bar_width)
+            
+            # Color based on usage for weekly
+            if weekly_utilization >= 90:
+                self.weekly_progress_fill.config(bg='#ff4444')
+            elif weekly_utilization >= 70:
+                self.weekly_progress_fill.config(bg='#ffaa44')
+            else:
+                self.weekly_progress_fill.config(bg='#8B6BB7')
+            
+            # Update weekly reset timer
+            if weekly_resets_at:
+                try:
+                    from dateutil import parser
+                    reset_time = parser.parse(weekly_resets_at)
+                    now = datetime.now(reset_time.tzinfo)
+                    time_left = reset_time - now
+                    
+                    if time_left.total_seconds() > 0:
+                        time_str = self.format_time_remaining(time_left.total_seconds())
+                        self.weekly_reset_label.config(text=f"Resets in: {time_str}")
+                    else:
+                        self.weekly_reset_label.config(text="Resetting soon...")
+                except:
+                    self.weekly_reset_label.config(text=f"Resets: {weekly_resets_at}")
+            else:
+                if weekly_utilization == 0:
+                    self.weekly_reset_label.config(text="No active period")
+                else:
+                    self.weekly_reset_label.config(text="Reset time unavailable")
                 
         except Exception as e:
             print(f"Error updating progress: {e}")
             import traceback
             traceback.print_exc()
-            self.usage_label.config(text="Error displaying usage")
+            self.five_hour_usage_label.config(text="Error displaying usage")
+            self.weekly_usage_label.config(text="Error displaying usage")
         
         # Schedule next update
         self.root.after(1000, self.update_progress)
