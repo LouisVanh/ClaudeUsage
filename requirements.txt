@@ -1,0 +1,13 @@
+cloudscraper
+   undetected-chromedriver
+   python-dateutil
+```
+   - `README.md` with installation instructions
+   - `.gitignore`:
+```
+   __pycache__/
+   *.pyc
+   .venv/
+   dist/
+   build/
+   *.spec
