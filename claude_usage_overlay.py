@@ -8,6 +8,22 @@ from pathlib import Path
 import threading
 import time
 import sys
+import ctypes
+
+# System Tray
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+
+# Notifications
+try:
+    from plyer import notification as plyer_notification
+    NOTIFICATIONS_AVAILABLE = True
+except ImportError:
+    NOTIFICATIONS_AVAILABLE = False
 
 class ClaudeUsageBar:
     def __init__(self):
@@ -34,11 +50,31 @@ class ClaudeUsageBar:
         self.login_in_progress = False
         self.settings_window = None
         self.clickthrough_enabled = False
+
+        # New feature states
+        self.api_status = 'unknown'  # 'ok', 'warning', 'error', 'unknown'
+        self.last_api_error = None
+        self.retry_count = 0
+        self.tray_icon = None
+        self.is_hidden = False
+        self.notification_sent = {}  # Track sent notifications to avoid spam
+        self.last_five_hour_utilization = 0
+        self.last_weekly_utilization = 0
+        self.snapped_edge = None  # Track which edge we're snapped to
+        self.collapsed = False  # For edge snap collapse feature
         
         # Setup UI
         self.setup_ui()
         self.position_window()
-        
+
+        # Apply compact mode if enabled
+        if self.config.get('compact_mode', False):
+            self.apply_compact_mode()
+
+        # Initialize system tray
+        if TRAY_AVAILABLE:
+            self.create_tray_icon()
+
         # Check if we have auth token
         if not self.config.get('session_key'):
             self.root.after(500, self.show_login_dialog)
@@ -50,7 +86,14 @@ class ClaudeUsageBar:
             'position': {'x': 20, 'y': 80},
             'opacity': 0.9,
             'session_key': None,
-            'poll_interval': 60
+            'poll_interval': 60,
+            # New features
+            'minimize_to_tray': False,
+            'notification_thresholds': [80, 95, 99, 100],
+            'notification_cooldown': 300,  # seconds
+            'compact_mode': False,
+            'snap_mode': 'off',  # 'off', 'edge', 'taskbar'
+            'auto_refresh_session': False
         }
         
         if self.config_file.exists():
@@ -300,12 +343,22 @@ class ClaudeUsageBar:
             ])
             self.login_in_progress = False
     
-    def fetch_usage_data(self):
-        """Fetch usage data from Claude API using requests with cloudflare bypass"""
+    def fetch_usage_data(self, retry_attempt=0):
+        """Fetch usage data from Claude API with retry logic"""
         if not self.config.get('session_key'):
+            self.api_status = 'error'
+            self.last_api_error = 'No session key'
             return None
-            
+
+        max_retries = 3
+        base_delay = 2  # seconds
+
         try:
+            # Update status to warning if retrying
+            if retry_attempt > 0:
+                self.api_status = 'warning'
+                self.root.after(0, self.update_api_status_ui)
+
             # Use cloudscraper to bypass Cloudflare
             try:
                 import cloudscraper
@@ -314,7 +367,7 @@ class ClaudeUsageBar:
                 import sys
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "cloudscraper"])
                 import cloudscraper
-            
+
             # Create a scraper that bypasses Cloudflare
             scraper = cloudscraper.create_scraper(
                 browser={
@@ -323,10 +376,10 @@ class ClaudeUsageBar:
                     'mobile': False
                 }
             )
-            
+
             # Use full cookie string if available
             cookie_string = self.config.get('cookie_string', f'sessionKey={self.config["session_key"]}')
-            
+
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'application/json',
@@ -339,53 +392,129 @@ class ClaudeUsageBar:
                 'sec-ch-ua-mobile': '?0',
                 'sec-ch-ua-platform': '"Windows"',
             }
-            
+
             # Set cookies
             for cookie_pair in cookie_string.split('; '):
                 if '=' in cookie_pair:
                     name, value = cookie_pair.split('=', 1)
                     scraper.cookies.set(name, value, domain='claude.ai')
-            
+
             # Get organizations
             response = scraper.get(
                 'https://claude.ai/api/organizations',
                 headers=headers,
                 timeout=15
             )
-            
+
             if response.status_code == 200:
                 orgs = response.json()
-                
+
                 if orgs and len(orgs) > 0:
                     org_id = orgs[0].get('uuid')
-                    
+
                     # Get usage
                     usage_response = scraper.get(
                         f'https://claude.ai/api/organizations/{org_id}/usage',
                         headers=headers,
                         timeout=15
                     )
-                    
+
                     if usage_response.status_code == 200:
                         usage_data = usage_response.json()
+                        # Success!
+                        self.api_status = 'ok'
+                        self.last_api_error = None
+                        self.retry_count = 0
+                        self.root.after(0, self.update_api_status_ui)
                         return usage_data
-            
+
             elif response.status_code == 401:
+                self.api_status = 'error'
+                self.last_api_error = 'Session expired (401)'
+                self.root.after(0, self.update_api_status_ui)
                 self.root.after(0, self.handle_auth_error)
                 return None
-            
+
+            elif response.status_code == 429:
+                self.api_status = 'warning'
+                self.last_api_error = 'Rate limited (429)'
+                # Rate limited - retry with longer delay
+                if retry_attempt < max_retries:
+                    delay = base_delay * (2 ** retry_attempt) * 2  # Double delay for rate limit
+                    time.sleep(delay)
+                    return self.fetch_usage_data(retry_attempt + 1)
+
+            # Other errors - retry
+            if retry_attempt < max_retries:
+                self.api_status = 'warning'
+                self.last_api_error = f'HTTP {response.status_code}'
+                delay = base_delay * (2 ** retry_attempt)
+                time.sleep(delay)
+                return self.fetch_usage_data(retry_attempt + 1)
+
+            self.api_status = 'error'
+            self.last_api_error = f'Failed after {max_retries} retries'
+            self.root.after(0, self.update_api_status_ui)
             return None
-                
+
+        except requests.exceptions.Timeout:
+            self.last_api_error = 'Timeout'
+            if retry_attempt < max_retries:
+                self.api_status = 'warning'
+                delay = base_delay * (2 ** retry_attempt)
+                time.sleep(delay)
+                return self.fetch_usage_data(retry_attempt + 1)
+            self.api_status = 'error'
+            self.root.after(0, self.update_api_status_ui)
+            return None
+
+        except requests.exceptions.ConnectionError:
+            self.last_api_error = 'No connection'
+            if retry_attempt < max_retries:
+                self.api_status = 'warning'
+                delay = base_delay * (2 ** retry_attempt)
+                time.sleep(delay)
+                return self.fetch_usage_data(retry_attempt + 1)
+            self.api_status = 'error'
+            self.root.after(0, self.update_api_status_ui)
+            return None
+
         except Exception as e:
+            self.last_api_error = str(e)[:30]
+            if retry_attempt < max_retries:
+                self.api_status = 'warning'
+                delay = base_delay * (2 ** retry_attempt)
+                time.sleep(delay)
+                return self.fetch_usage_data(retry_attempt + 1)
+            self.api_status = 'error'
+            self.root.after(0, self.update_api_status_ui)
             return None
     
     def handle_auth_error(self):
-        """Handle authentication errors"""
-        if messagebox.askyesno("Session Expired", 
-                               "Your session has expired. Would you like to log in again?"):
+        """Handle authentication errors with auto-refresh option"""
+        # Send notification
+        if NOTIFICATIONS_AVAILABLE:
+            self.send_notification(
+                "Claude Session Expired",
+                "Your session has expired. Click to re-authenticate.",
+                "auth",
+                0
+            )
+
+        if self.config.get('auto_refresh_session', False):
+            # Auto-refresh: directly open browser
             self.config['session_key'] = None
+            self.config['cookie_string'] = None
             self.save_config()
             self.show_login_dialog()
+        else:
+            # Ask user
+            if messagebox.askyesno("Session Expired",
+                                   "Your session has expired. Would you like to log in again?"):
+                self.config['session_key'] = None
+                self.config['cookie_string'] = None
+                self.save_config()
+                self.show_login_dialog()
     
     def polling_loop(self):
         """Background thread for polling API"""
@@ -464,6 +593,20 @@ class ClaudeUsageBar:
         # Tooltip for clickthrough
         self.clickthrough_tooltip = None
         
+        # API Status indicator
+        self.api_status_dot = tk.Label(
+            self.header,
+            text="●",
+            font=('Segoe UI', 8),
+            fg='#888888',
+            bg='#2a2a2a',
+            cursor='hand2'
+        )
+        self.api_status_dot.pack(side='left', padx=(4, 0))
+        self.api_status_dot.bind('<Enter>', self.show_api_status_tooltip)
+        self.api_status_dot.bind('<Leave>', self.hide_api_status_tooltip)
+        self.api_status_tooltip = None
+
         self.title_label = tk.Label(
             self.header,
             text="Claude Usage",
@@ -484,10 +627,25 @@ class ClaudeUsageBar:
         self.btn_frame = tk.Frame(self.header, bg='#2a2a2a')
         self.btn_frame.pack(side='right')
         
+        # Compact mode toggle
+        self.compact_btn = tk.Label(
+            self.btn_frame,
+            text="▬",
+            font=('Segoe UI', 9),
+            fg='#888888',
+            bg='#2a2a2a',
+            cursor='hand2',
+            padx=4
+        )
+        self.compact_btn.pack(side='left', padx=2)
+        self.compact_btn.bind('<Button-1>', self.toggle_compact_mode)
+        self.compact_btn.bind('<Enter>', lambda e: self.on_icon_hover(self.compact_btn, '#CC785C'))
+        self.compact_btn.bind('<Leave>', lambda e: self.on_icon_leave(self.compact_btn, '#888888'))
+
         # Refresh
         self.refresh_btn = tk.Label(
             self.btn_frame,
-            text="\u21BB", 
+            text="\u21BB",
             font=('Segoe UI Symbol', 11, 'bold'),
             fg='#888888',
             bg='#2a2a2a',
@@ -532,16 +690,17 @@ class ClaudeUsageBar:
         # Content
         self.content_frame = tk.Frame(self.main_frame, bg='#1a1a1a')
         self.content_frame.pack(fill='x', padx=8, pady=8)
-        
+
         # 5-Hour Usage section
-        tk.Label(
+        self.five_hour_title = tk.Label(
             self.content_frame,
             text="5-Hour Limit",
             font=('Segoe UI', 8, 'bold'),
             fg='#888888',
             bg='#1a1a1a',
             anchor='w'
-        ).pack(fill='x', pady=(0, 2))
+        )
+        self.five_hour_title.pack(fill='x', pady=(0, 2))
         
         self.five_hour_usage_label = tk.Label(
             self.content_frame,
@@ -554,11 +713,11 @@ class ClaudeUsageBar:
         self.five_hour_usage_label.pack(fill='x', pady=(0, 2))
         
         # 5-Hour Progress bar
-        five_hour_progress_bg = tk.Frame(self.content_frame, bg='#2a2a2a', height=12)
-        five_hour_progress_bg.pack(fill='x', pady=(0, 2))
-        five_hour_progress_bg.pack_propagate(False)
-        
-        self.five_hour_progress_fill = tk.Frame(five_hour_progress_bg, bg='#CC785C', height=12)
+        self.five_hour_progress_bg = tk.Frame(self.content_frame, bg='#2a2a2a', height=12)
+        self.five_hour_progress_bg.pack(fill='x', pady=(0, 2))
+        self.five_hour_progress_bg.pack_propagate(False)
+
+        self.five_hour_progress_fill = tk.Frame(self.five_hour_progress_bg, bg='#CC785C', height=12)
         self.five_hour_progress_fill.place(x=0, y=0, relheight=1, width=0)
         
         self.five_hour_reset_label = tk.Label(
@@ -574,16 +733,17 @@ class ClaudeUsageBar:
         # Separator
         self.separator = tk.Frame(self.content_frame, bg='#333333', height=1)
         self.separator.pack(fill='x', pady=(0, 8))
-        
+
         # Weekly Usage section
-        tk.Label(
+        self.weekly_title = tk.Label(
             self.content_frame,
             text="Weekly Limit",
             font=('Segoe UI', 8, 'bold'),
             fg='#888888',
             bg='#1a1a1a',
             anchor='w'
-        ).pack(fill='x', pady=(0, 2))
+        )
+        self.weekly_title.pack(fill='x', pady=(0, 2))
         
         self.weekly_usage_label = tk.Label(
             self.content_frame,
@@ -596,11 +756,11 @@ class ClaudeUsageBar:
         self.weekly_usage_label.pack(fill='x', pady=(0, 2))
         
         # Weekly Progress bar
-        weekly_progress_bg = tk.Frame(self.content_frame, bg='#2a2a2a', height=12)
-        weekly_progress_bg.pack(fill='x', pady=(0, 2))
-        weekly_progress_bg.pack_propagate(False)
-        
-        self.weekly_progress_fill = tk.Frame(weekly_progress_bg, bg='#8B6BB7', height=12)
+        self.weekly_progress_bg = tk.Frame(self.content_frame, bg='#2a2a2a', height=12)
+        self.weekly_progress_bg.pack(fill='x', pady=(0, 2))
+        self.weekly_progress_bg.pack_propagate(False)
+
+        self.weekly_progress_fill = tk.Frame(self.weekly_progress_bg, bg='#8B6BB7', height=12)
         self.weekly_progress_fill.place(x=0, y=0, relheight=1, width=0)
         
         self.weekly_reset_label = tk.Label(
@@ -642,9 +802,15 @@ class ClaudeUsageBar:
     def stop_drag(self, event):
         if self.dragging:
             self.dragging = False
-            self.config['position']['x'] = self.root.winfo_x()
-            self.config['position']['y'] = self.root.winfo_y()
+            # Apply snap
+            x, y = self.apply_snap(self.root.winfo_x(), self.root.winfo_y())
+            self.root.geometry(f'+{x}+{y}')
+            self.config['position']['x'] = x
+            self.config['position']['y'] = y
             self.save_config()
+            # Setup edge collapse if needed
+            if self.config.get('snap_mode') == 'edge' and self.snapped_edge:
+                self.setup_edge_collapse()
     
     def position_window(self):
         self.root.update_idletasks()
@@ -744,11 +910,20 @@ class ClaudeUsageBar:
                     self.weekly_reset_label.config(text="No active period")
                 else:
                     self.weekly_reset_label.config(text="Reset time unavailable")
-                
+
+            # Check and send notifications
+            if NOTIFICATIONS_AVAILABLE:
+                self.check_and_send_notifications(five_hour_utilization, 'five_hour', '5-Hour')
+                self.check_and_send_notifications(weekly_utilization, 'weekly', 'Weekly')
+
+            # Update last utilization values for next comparison
+            self.last_five_hour_utilization = five_hour_utilization
+            self.last_weekly_utilization = weekly_utilization
+
         except Exception as e:
             self.five_hour_usage_label.config(text="Error displaying usage")
             self.weekly_usage_label.config(text="Error displaying usage")
-        
+
         # Schedule next update
         self.root.after(1000, self.update_progress)
     
@@ -773,7 +948,7 @@ class ClaudeUsageBar:
         
         self.settings_window = tk.Toplevel(self.root)
         self.settings_window.title("Settings")
-        self.settings_window.geometry("400x400")
+        self.settings_window.geometry("400x650")
         self.settings_window.attributes('-topmost', True)
         self.settings_window.configure(bg='#1a1a1a')
         self.settings_window.protocol("WM_DELETE_WINDOW", lambda: self.close_settings())
@@ -788,7 +963,7 @@ class ClaudeUsageBar:
         ).pack(pady=(20, 5))
         
         # Show session key snippet
-        session_key = self.config.get('session_key', 'Not logged in')
+        session_key = self.config.get('session_key') or 'Not logged in'
         display_key = f"{session_key[:15]}..." if len(session_key) > 15 else session_key
         
         tk.Label(
@@ -933,11 +1108,125 @@ class ClaudeUsageBar:
             fg='#666666',
             bg='#1a1a1a'
         ).pack(pady=(0, 10))
-        
+
+        # Separator
+        tk.Frame(self.settings_window, bg='#333333', height=1).pack(fill='x', padx=20, pady=10)
+
+        # System Tray option
+        if TRAY_AVAILABLE:
+            tray_var = tk.BooleanVar(value=self.config.get('minimize_to_tray', False))
+            tray_check = tk.Checkbutton(
+                self.settings_window,
+                text="Minimize to System Tray",
+                variable=tray_var,
+                font=('Segoe UI', 9),
+                fg='#cccccc',
+                bg='#1a1a1a',
+                selectcolor='#2a2a2a',
+                activebackground='#1a1a1a',
+                activeforeground='#cccccc'
+            )
+            tray_check.pack(pady=5)
+        else:
+            tray_var = tk.BooleanVar(value=False)
+
+        # Auto Refresh Session
+        auto_refresh_var = tk.BooleanVar(value=self.config.get('auto_refresh_session', False))
+        auto_refresh_check = tk.Checkbutton(
+            self.settings_window,
+            text="Auto-refresh expired sessions",
+            variable=auto_refresh_var,
+            font=('Segoe UI', 9),
+            fg='#cccccc',
+            bg='#1a1a1a',
+            selectcolor='#2a2a2a',
+            activebackground='#1a1a1a',
+            activeforeground='#cccccc'
+        )
+        auto_refresh_check.pack(pady=5)
+
+        # Separator
+        tk.Frame(self.settings_window, bg='#333333', height=1).pack(fill='x', padx=20, pady=10)
+
+        # Snap Mode
+        tk.Label(
+            self.settings_window,
+            text="Window Snap Mode",
+            font=('Segoe UI', 9, 'bold'),
+            fg='#cccccc',
+            bg='#1a1a1a'
+        ).pack(pady=(5, 5))
+
+        snap_var = tk.StringVar(value=self.config.get('snap_mode', 'off'))
+        snap_frame = tk.Frame(self.settings_window, bg='#1a1a1a')
+        snap_frame.pack(pady=5)
+
+        for text, value in [("Off", "off"), ("Screen Edge", "edge"), ("Taskbar", "taskbar")]:
+            tk.Radiobutton(
+                snap_frame,
+                text=text,
+                variable=snap_var,
+                value=value,
+                font=('Segoe UI', 9),
+                fg='#cccccc',
+                bg='#1a1a1a',
+                selectcolor='#2a2a2a',
+                activebackground='#1a1a1a',
+                activeforeground='#cccccc'
+            ).pack(side='left', padx=10)
+
+        # Separator
+        tk.Frame(self.settings_window, bg='#333333', height=1).pack(fill='x', padx=20, pady=10)
+
+        # Notification Thresholds
+        if NOTIFICATIONS_AVAILABLE:
+            tk.Label(
+                self.settings_window,
+                text="Notification Thresholds (%)",
+                font=('Segoe UI', 9, 'bold'),
+                fg='#cccccc',
+                bg='#1a1a1a'
+            ).pack(pady=(5, 5))
+
+            thresholds_str = ', '.join(str(t) for t in self.config.get('notification_thresholds', [80, 95, 99, 100]))
+            thresholds_var = tk.StringVar(value=thresholds_str)
+            thresholds_entry = tk.Entry(
+                self.settings_window,
+                textvariable=thresholds_var,
+                font=('Segoe UI', 9),
+                bg='#2a2a2a',
+                fg='#cccccc',
+                insertbackground='#cccccc',
+                relief='flat',
+                width=25
+            )
+            thresholds_entry.pack(pady=5)
+
+            tk.Label(
+                self.settings_window,
+                text="(comma-separated, e.g. 80, 95, 99, 100)",
+                font=('Segoe UI', 7),
+                fg='#666666',
+                bg='#1a1a1a'
+            ).pack()
+        else:
+            thresholds_var = tk.StringVar(value="80, 95, 99, 100")
+
         # Save button
         def save_settings():
             self.config['opacity'] = opacity_var.get()
             self.config['poll_interval'] = interval_var.get()
+            self.config['minimize_to_tray'] = tray_var.get()
+            self.config['auto_refresh_session'] = auto_refresh_var.get()
+            self.config['snap_mode'] = snap_var.get()
+
+            # Parse thresholds
+            try:
+                thresholds = [int(t.strip()) for t in thresholds_var.get().split(',') if t.strip()]
+                self.config['notification_thresholds'] = sorted(thresholds)
+            except:
+                pass  # Keep existing thresholds on parse error
+
             self.save_config()
             self.close_settings()
         
@@ -1064,21 +1353,375 @@ class ClaudeUsageBar:
         if self.clickthrough_tooltip:
             self.clickthrough_tooltip.destroy()
             self.clickthrough_tooltip = None
-        
+
         if self.clickthrough_enabled:
             self.clickthrough_btn.config(fg='#44ff44')
         else:
             self.clickthrough_btn.config(fg='#888888')
-    
-    def on_close(self, event=None):
-        if self.clickthrough_enabled: return
+
+    def update_api_status_ui(self):
+        """Update API status indicator color"""
+        colors = {
+            'ok': '#44ff44',      # Green
+            'warning': '#ffaa44', # Yellow/Orange
+            'error': '#ff4444',   # Red
+            'unknown': '#888888'  # Gray
+        }
+        color = colors.get(self.api_status, '#888888')
+        self.api_status_dot.config(fg=color)
+
+    def show_api_status_tooltip(self, event):
+        """Show API status tooltip"""
+        status_text = {
+            'ok': 'API: Connected',
+            'warning': f'API: Retrying... ({self.last_api_error or ""})',
+            'error': f'API: Error ({self.last_api_error or "Unknown"})',
+            'unknown': 'API: Unknown'
+        }
+        text = status_text.get(self.api_status, 'API: Unknown')
+
+        self.api_status_tooltip = tk.Toplevel(self.root)
+        self.api_status_tooltip.wm_overrideredirect(True)
+        self.api_status_tooltip.wm_attributes('-topmost', True)
+
+        label = tk.Label(
+            self.api_status_tooltip,
+            text=text,
+            bg='#3a3a3a',
+            fg='#ffffff',
+            font=('Segoe UI', 8),
+            padx=8,
+            pady=4,
+            relief='solid',
+            borderwidth=1
+        )
+        label.pack()
+
+        x = self.api_status_dot.winfo_rootx()
+        y = self.api_status_dot.winfo_rooty() + self.api_status_dot.winfo_height() + 2
+        self.api_status_tooltip.wm_geometry(f"+{x}+{y}")
+
+    def hide_api_status_tooltip(self, event):
+        """Hide API status tooltip"""
+        if self.api_status_tooltip:
+            self.api_status_tooltip.destroy()
+            self.api_status_tooltip = None
+
+    def create_tray_icon(self):
+        """Create system tray icon"""
+        if not TRAY_AVAILABLE:
+            return
+
+        # Create a simple icon (orange circle)
+        def create_image():
+            size = 64
+            image = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            # Draw orange circle
+            draw.ellipse([4, 4, size-4, size-4], fill='#CC785C')
+            return image
+
+        def on_show(icon, item):
+            self.root.after(0, self.show_window)
+
+        def on_refresh(icon, item):
+            self.root.after(0, lambda: self.manual_refresh(None))
+
+        def on_settings(icon, item):
+            self.root.after(0, lambda: self.show_settings(None))
+
+        def on_exit(icon, item):
+            self.root.after(0, self.quit_app)
+
+        menu = pystray.Menu(
+            pystray.MenuItem('Show', on_show, default=True),
+            pystray.MenuItem('Refresh', on_refresh),
+            pystray.MenuItem('Settings', on_settings),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('Exit', on_exit)
+        )
+
+        self.tray_icon = pystray.Icon(
+            'ClaudeUsage',
+            create_image(),
+            'Claude Usage',
+            menu
+        )
+
+        # Run tray icon in separate thread
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def show_window(self):
+        """Show the main window"""
+        self.root.deiconify()
+        self.root.attributes('-topmost', True)
+        self.is_hidden = False
+
+    def hide_window(self):
+        """Hide to system tray"""
+        if TRAY_AVAILABLE and self.config.get('minimize_to_tray'):
+            self.root.withdraw()
+            self.is_hidden = True
+        else:
+            self.quit_app()
+
+    def quit_app(self):
+        """Completely quit the application"""
         self.polling_active = False
+        if self.tray_icon:
+            self.tray_icon.stop()
         if self.driver:
             try:
                 self.driver.quit()
             except:
                 pass
         self.root.quit()
+
+    def send_notification(self, title, message, limit_type, threshold):
+        """Send a desktop notification with cooldown"""
+        if not NOTIFICATIONS_AVAILABLE:
+            return
+
+        # Create unique key for this notification
+        key = f"{limit_type}_{threshold}"
+        current_time = time.time()
+        cooldown = self.config.get('notification_cooldown', 300)
+
+        # Check cooldown
+        if key in self.notification_sent:
+            if current_time - self.notification_sent[key] < cooldown:
+                return  # Still in cooldown
+
+        try:
+            plyer_notification.notify(
+                title=title,
+                message=message,
+                app_name='Claude Usage',
+                timeout=10
+            )
+            self.notification_sent[key] = current_time
+        except Exception as e:
+            pass  # Silently fail notifications
+
+    def check_and_send_notifications(self, utilization, limit_type, limit_name):
+        """Check utilization against thresholds and send notifications"""
+        thresholds = self.config.get('notification_thresholds', [80, 95, 99, 100])
+
+        for threshold in sorted(thresholds):
+            if utilization >= threshold:
+                # Get previous utilization
+                prev_util = self.last_five_hour_utilization if limit_type == 'five_hour' else self.last_weekly_utilization
+
+                # Only notify if we just crossed this threshold
+                if prev_util < threshold:
+                    if threshold >= 100:
+                        title = f"Claude {limit_name} Limit Reached!"
+                        message = f"You've reached 100% of your {limit_name.lower()} limit."
+                    elif threshold >= 95:
+                        title = f"Claude {limit_name} Almost Full"
+                        message = f"You've used {utilization:.0f}% of your {limit_name.lower()} limit."
+                    else:
+                        title = f"Claude {limit_name} Warning"
+                        message = f"You've used {utilization:.0f}% of your {limit_name.lower()} limit."
+
+                    self.send_notification(title, message, limit_type, threshold)
+
+    def toggle_compact_mode(self, event=None):
+        """Toggle between compact and normal mode"""
+        if self.clickthrough_enabled:
+            return
+
+        self.config['compact_mode'] = not self.config.get('compact_mode', False)
+        self.save_config()
+        self.apply_compact_mode()
+
+    def apply_compact_mode(self):
+        """Apply compact or normal mode to UI"""
+        compact = self.config.get('compact_mode', False)
+
+        if compact:
+            # Hide labels and reset times, show only progress bars with percentages
+            self.five_hour_title.pack_forget()
+            self.five_hour_reset_label.pack_forget()
+            self.weekly_title.pack_forget()
+            self.weekly_reset_label.pack_forget()
+            self.separator.pack_forget()
+
+            # Resize window to compact
+            self.root.geometry('300x90')
+            self.compact_btn.config(text="▭")  # Change icon to indicate expand
+        else:
+            # Rebuild normal layout - need to repack in order
+            for widget in self.content_frame.winfo_children():
+                widget.pack_forget()
+
+            # Repack everything in correct order
+            self.five_hour_title.pack(fill='x', pady=(0, 2))
+            self.five_hour_usage_label.pack(fill='x', pady=(0, 2))
+            self.five_hour_progress_bg.pack(fill='x', pady=(0, 2))
+            self.five_hour_reset_label.pack(fill='x', pady=(0, 10))
+
+            self.separator.pack(fill='x', pady=(0, 8))
+
+            self.weekly_title.pack(fill='x', pady=(0, 2))
+            self.weekly_usage_label.pack(fill='x', pady=(0, 2))
+            self.weekly_progress_bg.pack(fill='x', pady=(0, 2))
+            self.weekly_reset_label.pack(fill='x')
+
+            # Resize window to normal
+            self.root.geometry('300x240')
+            self.compact_btn.config(text="▬")  # Change icon to indicate compact
+
+    def get_screen_geometry(self):
+        """Get screen dimensions"""
+        return {
+            'width': self.root.winfo_screenwidth(),
+            'height': self.root.winfo_screenheight()
+        }
+
+    def get_taskbar_info(self):
+        """Get taskbar position and size (Windows-specific)"""
+        try:
+            # Try to detect taskbar position using ctypes
+            from ctypes import wintypes, windll, Structure, POINTER, byref
+
+            class APPBARDATA(Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("hWnd", wintypes.HWND),
+                    ("uCallbackMessage", wintypes.UINT),
+                    ("uEdge", wintypes.UINT),
+                    ("rc", wintypes.RECT),
+                    ("lParam", wintypes.LPARAM),
+                ]
+
+            ABM_GETTASKBARPOS = 0x05
+            abd = APPBARDATA()
+            abd.cbSize = ctypes.sizeof(APPBARDATA)
+            windll.shell32.SHAppBarMessage(ABM_GETTASKBARPOS, byref(abd))
+
+            # uEdge: 0=left, 1=top, 2=right, 3=bottom
+            edges = {0: 'left', 1: 'top', 2: 'right', 3: 'bottom'}
+            return {
+                'edge': edges.get(abd.uEdge, 'bottom'),
+                'left': abd.rc.left,
+                'top': abd.rc.top,
+                'right': abd.rc.right,
+                'bottom': abd.rc.bottom,
+                'height': abd.rc.bottom - abd.rc.top,
+                'width': abd.rc.right - abd.rc.left
+            }
+        except:
+            # Default fallback - assume bottom taskbar
+            screen = self.get_screen_geometry()
+            return {
+                'edge': 'bottom',
+                'left': 0,
+                'top': screen['height'] - 40,
+                'right': screen['width'],
+                'bottom': screen['height'],
+                'height': 40,
+                'width': screen['width']
+            }
+
+    def apply_snap(self, x, y):
+        """Apply snap behavior based on snap_mode setting"""
+        snap_mode = self.config.get('snap_mode', 'off')
+        if snap_mode == 'off':
+            return x, y
+
+        screen = self.get_screen_geometry()
+        window_width = self.root.winfo_width()
+        window_height = self.root.winfo_height()
+        snap_distance = 20
+
+        if snap_mode == 'edge':
+            # Snap to screen edges
+            # Left edge
+            if x < snap_distance:
+                x = 0
+                self.snapped_edge = 'left'
+            # Right edge
+            elif x + window_width > screen['width'] - snap_distance:
+                x = screen['width'] - window_width
+                self.snapped_edge = 'right'
+            # Top edge
+            elif y < snap_distance:
+                y = 0
+                self.snapped_edge = 'top'
+            # Bottom edge
+            elif y + window_height > screen['height'] - snap_distance:
+                y = screen['height'] - window_height
+                self.snapped_edge = 'bottom'
+            else:
+                self.snapped_edge = None
+
+        elif snap_mode == 'taskbar':
+            # Snap relative to taskbar
+            taskbar = self.get_taskbar_info()
+            if taskbar['edge'] == 'bottom':
+                # Position above taskbar
+                y = taskbar['top'] - window_height
+            elif taskbar['edge'] == 'top':
+                # Position below taskbar
+                y = taskbar['bottom']
+            elif taskbar['edge'] == 'left':
+                # Position to right of taskbar
+                x = taskbar['right']
+            elif taskbar['edge'] == 'right':
+                # Position to left of taskbar
+                x = taskbar['left'] - window_width
+
+            self.snapped_edge = taskbar['edge']
+
+        return x, y
+
+    def setup_edge_collapse(self):
+        """Setup hover bindings for edge collapse/expand"""
+        if self.config.get('snap_mode') == 'edge' and self.snapped_edge:
+            self.root.bind('<Enter>', self.expand_from_edge)
+            self.root.bind('<Leave>', self.collapse_to_edge)
+
+    def expand_from_edge(self, event=None):
+        """Expand window when mouse enters (for edge snap)"""
+        if not self.collapsed or self.config.get('snap_mode') != 'edge':
+            return
+
+        self.collapsed = False
+        # Restore full window
+        if self.config.get('compact_mode'):
+            self.root.geometry('300x90')
+        else:
+            self.root.geometry('300x240')
+
+    def collapse_to_edge(self, event=None):
+        """Collapse window when mouse leaves (for edge snap)"""
+        if self.config.get('snap_mode') != 'edge' or not self.snapped_edge:
+            return
+
+        # Only collapse if mouse is actually leaving
+        x, y = self.root.winfo_pointerx(), self.root.winfo_pointery()
+        wx, wy = self.root.winfo_rootx(), self.root.winfo_rooty()
+        ww, wh = self.root.winfo_width(), self.root.winfo_height()
+
+        if wx <= x <= wx + ww and wy <= y <= wy + wh:
+            return  # Mouse still inside
+
+        self.collapsed = True
+        # Show only a thin strip
+        if self.snapped_edge in ['left', 'right']:
+            self.root.geometry(f'10x{wh}')
+        else:
+            self.root.geometry(f'{ww}x10')
+    
+    def on_close(self, event=None):
+        if self.clickthrough_enabled:
+            return
+        # Minimize to tray if enabled, otherwise quit
+        if TRAY_AVAILABLE and self.config.get('minimize_to_tray'):
+            self.hide_window()
+        else:
+            self.quit_app()
     
     def run(self):
         self.root.mainloop()

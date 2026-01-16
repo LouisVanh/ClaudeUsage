@@ -178,3 +178,15 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Claude Code
+.claude/
+tmpclaude-*
+
+# Distribution (exe files)
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
